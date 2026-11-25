@@ -650,7 +650,7 @@ private:
             if (splash_capture_only_) {
                 splash_capture_only_ = false;
                 capture_ = false;
-                release_capture();
+                if (!dump_.enabled()) release_capture();  // the present dump reads the same buffer
             }
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
@@ -664,7 +664,9 @@ private:
             if (dump_.due(shown - 1)) {
                 // Presentation is already queued and the queue/tracker locks are released. A sampled frame
                 // may stall here for its transfer fence and a private CPU copy. PNG and disk I/O run on a worker.
-                if (vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX) == VK_SUCCESS)
+                if (!capture_ptr_)
+                    dump_.disable("no capture buffer to read the frame from");
+                else if (vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX) == VK_SUCCESS)
                     dump_.save(shown, extent_, format_, dump_pq_, capture_ptr_, size_t(capture_size_));
                 else
                     dump_.disable("present dump fence wait failed");

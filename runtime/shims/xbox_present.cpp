@@ -12,6 +12,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <iterator>
+#include <mutex>
+#include <thread>
+
+#include "title_window.h"
 
 namespace rt::d3d12 {
 
@@ -144,11 +150,59 @@ HRESULT XboxPresentation::GetFrameStatisticsX(std::uint64_t token, UINT type_mas
     return from_pacer(pacer_.get_frame_statistics(token, type_mask, count, out));
 }
 
+static void count_title_present();
+
 HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                    const XboxPresentParameters* params) {
     // One trace line per present, whatever path the call takes out of present_x: the queue proxy's PresentX slot is
     // past the PC chain, so nothing else records it, and a frame loop's presents could not be counted from a trace.
-    return d3d12_trace::result("XboxPresentation::PresentX", present_x(plane_count, planes, params));
+    const HRESULT result = present_x(plane_count, planes, params);
+    if (SUCCEEDED(result)) count_title_present();
+    return d3d12_trace::result("XboxPresentation::PresentX", result);
+}
+
+// LOCAL: the title's present rate in its window caption, refreshed once a second by a thread of its own (the window
+// belongs to the title's thread, so the caption is set with a timed send that never blocks presentation).
+// LEONIDA_TITLE_FPS=0 turns it off.
+static std::atomic<std::uint64_t> g_title_presents{0};
+static void count_title_present() {
+    static const bool enabled = [] {
+        char value[8] = {};
+        std::size_t length = 0;
+        return !(getenv_s(&length, value, "LEONIDA_TITLE_FPS") == 0 && length > 1 && value[0] == '0');
+    }();
+    if (!enabled) return;
+    g_title_presents.fetch_add(1, std::memory_order_relaxed);
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            wchar_t original[256] = {};
+            HWND window = nullptr;
+            std::uint64_t last = g_title_presents.load();
+            auto last_time = std::chrono::steady_clock::now();
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const auto now = std::chrono::steady_clock::now();
+                const std::uint64_t count = g_title_presents.load();
+                const double seconds = std::chrono::duration<double>(now - last_time).count();
+                const double fps = seconds > 0 ? double(count - last) / seconds : 0.0;
+                last = count;
+                last_time = now;
+                if (!window || !IsWindow(window)) {
+                    window = find_title_window(GetCurrentProcessId());
+                    if (!window) continue;
+                    DWORD_PTR got = 0;
+                    if (!SendMessageTimeoutW(window, WM_GETTEXT, std::size(original), LPARAM(original),
+                                             SMTO_ABORTIFHUNG, 200, &got))
+                        original[0] = L'\0';
+                }
+                wchar_t caption[320];
+                std::swprintf(caption, std::size(caption), L"%ls%ls%.1f fps", original, original[0] ? L"  " : L"", fps);
+                DWORD_PTR ignored = 0;
+                SendMessageTimeoutW(window, WM_SETTEXT, 0, LPARAM(caption), SMTO_ABORTIFHUNG, 200, &ignored);
+            }
+        }).detach();
+    });
 }
 
 // LOCAL DIAGNOSTIC (LEONIDA_LOCAL_DIAGNOSTICS=1): which check refuses PresentX, with its HRESULT.
