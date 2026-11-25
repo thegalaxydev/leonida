@@ -3206,6 +3206,9 @@ struct DeviceState {
         std::vector<std::uint8_t> mirror;  // the title's bytes as the tracker last copied them
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
+        // Per slot: what the copy holds there is a V# with records (the released-backing rescan's test), kept on the
+        // host so the rescan need not read the copy, which is uncached device memory when it is in the arena.
+        std::vector<std::uint8_t> live_vsharp;
         std::vector<std::uint32_t> retries;
         std::set<std::uint32_t> empty_slots;
         std::uint32_t next_empty = 0;
@@ -3285,6 +3288,7 @@ struct DeviceState {
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
         else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
         std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
+        if (slot < heap.live_vsharp.size()) heap.live_vsharp[slot] = !(w[3] >> 30) && (w[2] || w[6]);
         return settled;
     }
 
@@ -3315,6 +3319,7 @@ struct DeviceState {
                 heap.fix_over = true;
             if (heap.fix_over) {
                 std::memset(heap.copy + at, 0, kDescriptorSize);
+                if (slot < heap.live_vsharp.size()) heap.live_vsharp[slot] = 0;
                 ++heap.deferred_fixes;
                 if (!heap.retry[slot]) {
                     heap.retry[slot] = 1;
@@ -3400,6 +3405,9 @@ struct DeviceState {
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
             heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
             for (auto slot = first; slot < end; ++slot) heap.retry[slot] = 0;
+            if (first < heap.live_vsharp.size())
+                std::fill(heap.live_vsharp.begin() + first,
+                          heap.live_vsharp.begin() + std::min<std::size_t>(end, heap.live_vsharp.size()), 0);
         });
         const auto t1 = clock::now();
         heap.fix_start = t1;
@@ -3413,8 +3421,7 @@ struct DeviceState {
             heap.checked_generation = generation;
             // Even an unchanged title slot may name a buffer released since the last submission.
             for (size_t at = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
-                auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
-                if (!(w[3] >> 30) && (w[2] || w[6])) {
+                if (heap.live_vsharp[at / kDescriptorSize]) {
                     const auto slot = at / kDescriptorSize;
                     if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
                         heap.retry[slot] = 1;
@@ -3639,6 +3646,7 @@ struct DeviceState {
                 heap->previous = heap->made.data();
             }
             heap->retry.assign(std::size_t(bytes / kDescriptorSize), 0);
+            heap->live_vsharp.assign(std::size_t(bytes / kDescriptorSize), 0);
             heap->pages = make_shadow_pages(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(console_va)),
                                             heap->input, std::size_t(bytes));
         }
